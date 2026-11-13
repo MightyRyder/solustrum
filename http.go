@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -59,13 +60,19 @@ func port() string {
 	return "8080"
 }
 
+// listenAddr binds every interface by default (containers need that). Set HOST
+// to 127.0.0.1 behind a reverse proxy so only the proxy can reach us.
+func listenAddr() string {
+	return net.JoinHostPort(os.Getenv("HOST"), port())
+}
+
 func main() {
 	handler, err := newHandler()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	addr := ":" + port()
+	addr := listenAddr()
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
@@ -77,7 +84,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		log.Printf("Server running at http://localhost%s", addr)
+		log.Printf("Server listening on %s", addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
