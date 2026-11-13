@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -70,8 +71,11 @@ func newHandler() (http.Handler, error) {
 	return mux, nil
 }
 
-// loadSites turns every directory in sites/ into a handler. Adding
-// sites/<name> serves <name>.<base> automatically; sites/root is the apex.
+// loadSites decides which directories in sites/ are real sites: hidden or
+// underscore-prefixed names are skipped (sites/.err_404 holds error pages, not
+// a site), and a folder must contain at least one .html page to be served.
+// sites/root answers the apex; every other name gets <name>.<base> and a path
+// prefix on the apex.
 func loadSites() (map[string]http.Handler, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
 	if err != nil {
@@ -79,24 +83,66 @@ func loadSites() (map[string]http.Handler, error) {
 	}
 
 	handlers := make(map[string]http.Handler, len(entries))
+	var accepted, skipped []string
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 
-		root, err := fs.Sub(sitesFS, "sites/"+entry.Name())
-		if err != nil {
-			return nil, fmt.Errorf("sub sites/%s: %w", entry.Name(), err)
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			skipped = append(skipped, name+" (hidden)")
+			continue
 		}
 
-		handlers[entry.Name()] = staticHandler(root)
+		root, err := fs.Sub(sitesFS, "sites/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("sub sites/%s: %w", name, err)
+		}
+
+		if !hasHTML(root) {
+			skipped = append(skipped, name+" (no html)")
+			continue
+		}
+
+		handlers[name] = staticHandler(root)
+		accepted = append(accepted, name)
 	}
 
 	if _, ok := handlers["root"]; !ok {
-		return nil, errors.New("sites/root is missing")
+		return nil, errors.New("sites/root is missing or contains no html")
+	}
+
+	sort.Strings(accepted)
+	sort.Strings(skipped)
+	log.Printf("sites: %s", strings.Join(accepted, ", "))
+	if len(skipped) > 0 {
+		log.Printf("sites skipped: %s", strings.Join(skipped, ", "))
 	}
 
 	return handlers, nil
+}
+
+// hasHTML reports whether a site folder contains at least one page.
+func hasHTML(root fs.FS) bool {
+	found := false
+
+	_ = fs.WalkDir(root, ".", func(p string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+
+		if strings.EqualFold(path.Ext(p), ".html") {
+			found = true
+
+			return fs.SkipAll
+		}
+
+		return nil
+	})
+
+	return found
 }
 
 // siteRouter serves every folder in sites/ two ways: as its own hostname and
