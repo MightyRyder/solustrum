@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +15,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -59,9 +63,49 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
-	mux.Handle("/", http.FileServer(http.FS(root)))
+	mux.Handle("/", staticHandler(root))
 
 	return mux, nil
+}
+
+// staticHandler serves the embedded site. Files carry a content-hash ETag and
+// "no-cache", so browsers and Cloudflare revalidate (cheap 304) instead of
+// replaying stale bytes after a deploy.
+func staticHandler(root fs.FS) http.Handler {
+	etags := make(map[string]string)
+	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		data, err := fs.ReadFile(root, p)
+		if err != nil {
+			return nil
+		}
+		sum := sha256.Sum256(data)
+		etags["/"+p] = `"` + hex.EncodeToString(sum[:8]) + `"`
+		return nil
+	})
+
+	files := http.FileServer(http.FS(root))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tag, ok := etags[assetName(r.URL.Path)]; ok {
+			w.Header().Set("ETag", tag)
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+
+		files.ServeHTTP(w, r)
+	})
+}
+
+// assetName maps a request path to the embedded file that answers it.
+func assetName(p string) string {
+	name := strings.TrimPrefix(path.Clean("/"+p), "/")
+	if name == "" || strings.HasSuffix(p, "/") {
+		name = path.Join(name, "index.html")
+	}
+
+	return "/" + name
 }
 
 // port returns the port AWS tells us to listen on, falling back to 8080 locally.
