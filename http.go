@@ -71,11 +71,12 @@ func newHandler() (http.Handler, error) {
 	return mux, nil
 }
 
-// loadSites decides which directories in sites/ are real sites: hidden or
-// underscore-prefixed names are skipped (sites/.err_404 holds error pages, not
-// a site), and a folder must contain at least one .html page to be served.
-// sites/root answers the apex; every other name gets <name>.<base> and a path
-// prefix on the apex.
+// loadSites decides what lives in sites/: hidden or underscore-prefixed names
+// are skipped (sites/.err_404 is for error pages, not a site). A folder with
+// html is a site and answers its own index; a folder without html is served as
+// a plain file tree, so a CDN folder needs no index.html and gets no directory
+// listing. sites/root answers the apex; every other name gets <name>.<base> and
+// a path prefix on the apex.
 func loadSites() (map[string]http.Handler, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
 	if err != nil {
@@ -101,17 +102,18 @@ func loadSites() (map[string]http.Handler, error) {
 			return nil, fmt.Errorf("sub sites/%s: %w", name, err)
 		}
 
-		if !hasHTML(root) {
-			skipped = append(skipped, name+" (no html)")
-			continue
+		withIndex := hasHTML(root)
+		if withIndex {
+			accepted = append(accepted, name+" (site)")
+		} else {
+			accepted = append(accepted, name+" (files)")
 		}
 
-		handlers[name] = staticHandler(root)
-		accepted = append(accepted, name)
+		handlers[name] = staticHandler(root, withIndex)
 	}
 
 	if _, ok := handlers["root"]; !ok {
-		return nil, errors.New("sites/root is missing or contains no html")
+		return nil, errors.New("sites/root is missing")
 	}
 
 	sort.Strings(accepted)
@@ -223,7 +225,7 @@ func siteFor(host, base string, sites map[string]http.Handler) (string, http.Han
 // staticHandler serves the embedded site. Files carry a content-hash ETag and
 // "no-cache", so browsers and Cloudflare revalidate (cheap 304) instead of
 // replaying stale bytes after a deploy.
-func staticHandler(root fs.FS) http.Handler {
+func staticHandler(root fs.FS, withIndex bool) http.Handler {
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -241,6 +243,13 @@ func staticHandler(root fs.FS) http.Handler {
 	files := http.FileServer(http.FS(root))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A file-only folder (sites/cdn) answers files, never a directory:
+		// no index page and no listing.
+		if !withIndex && strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+
 		if tag, ok := etags[assetName(r.URL.Path)]; ok {
 			w.Header().Set("ETag", tag)
 			w.Header().Set("Cache-Control", "no-cache")
