@@ -21,11 +21,13 @@ import (
 	"time"
 )
 
-// The site is compiled into the binary, so a single artifact can be shipped
-// to AWS without any extra files next to it.
+// Every directory under sites/ is compiled into the binary and served as its
+// own hostname, so a single artifact can be shipped to AWS with no side files.
 //
-//go:embed sites/root
-var site embed.FS
+//go:embed sites
+var sitesFS embed.FS
+
+const defaultBaseDomain = "solustrum.com"
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
@@ -44,9 +46,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func newHandler() (http.Handler, error) {
-	root, err := fs.Sub(site, "sites/root")
+	sites, err := loadSites()
 	if err != nil {
-		return nil, fmt.Errorf("sub sites/root: %w", err)
+		return nil, err
 	}
 
 	mux := http.NewServeMux()
@@ -63,9 +65,87 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
-	mux.Handle("/", staticHandler(root))
+	mux.Handle("/", siteRouter(sites))
 
 	return mux, nil
+}
+
+// loadSites turns every directory in sites/ into a handler. Adding
+// sites/<name> serves <name>.<base> automatically; sites/root is the apex.
+func loadSites() (map[string]http.Handler, error) {
+	entries, err := fs.ReadDir(sitesFS, "sites")
+	if err != nil {
+		return nil, fmt.Errorf("read sites: %w", err)
+	}
+
+	handlers := make(map[string]http.Handler, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		root, err := fs.Sub(sitesFS, "sites/"+entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("sub sites/%s: %w", entry.Name(), err)
+		}
+
+		handlers[entry.Name()] = staticHandler(root)
+	}
+
+	if _, ok := handlers["root"]; !ok {
+		return nil, errors.New("sites/root is missing")
+	}
+
+	return handlers, nil
+}
+
+// siteRouter picks the site from the Host header: the apex and localhost serve
+// sites/root, <name>.<base> serves sites/<name>, anything else falls back to
+// the root site so bare IP access still works.
+func siteRouter(sites map[string]http.Handler) http.Handler {
+	base := os.Getenv("BASE_DOMAIN")
+	if base == "" {
+		base = defaultBaseDomain
+	}
+	base = strings.ToLower(strings.TrimSuffix(base, "."))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler, ok := siteFor(r.Host, base, sites)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func siteFor(host, base string, sites map[string]http.Handler) (http.Handler, bool) {
+	host = strings.ToLower(host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(host, ".")
+
+	switch host {
+	case base, "www." + base, "localhost", "127.0.0.1", "::1":
+		handler, ok := sites["root"]
+
+		return handler, ok
+	}
+
+	// <name>.<base> and <name>.localhost (handy locally) map to sites/<name>.
+	for _, suffix := range []string{"." + base, ".localhost"} {
+		if name, found := strings.CutSuffix(host, suffix); found {
+			handler, ok := sites[name]
+
+			return handler, ok
+		}
+	}
+
+	handler, ok := sites["root"]
+
+	return handler, ok
 }
 
 // staticHandler serves the embedded site. Files carry a content-hash ETag and
