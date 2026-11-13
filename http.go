@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -46,6 +48,17 @@ func newHandler() (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hello", helloHandler)
 	mux.HandleFunc("/healthz", healthHandler)
+
+	// The Cloudflare tunnel points straight at this process, so the deploy
+	// webhook has to be forwarded to its own listener. Unset = disabled.
+	if target := os.Getenv("WEBHOOK_URL"); target != "" {
+		u, err := url.Parse(target)
+		if err != nil {
+			return nil, fmt.Errorf("parse WEBHOOK_URL: %w", err)
+		}
+		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
+	}
+
 	mux.Handle("/", http.FileServer(http.FS(root)))
 
 	return mux, nil
