@@ -99,9 +99,10 @@ func loadSites() (map[string]http.Handler, error) {
 	return handlers, nil
 }
 
-// siteRouter picks the site from the Host header: the apex and localhost serve
-// sites/root, <name>.<base> serves sites/<name>, anything else falls back to
-// the root site so bare IP access still works.
+// siteRouter serves every folder in sites/ two ways: as its own hostname and
+// as a path prefix on the apex, so sites/website answers both
+// website.<base> and <base>/website/. sites/root is the apex itself, and
+// anything nested stays a path under both.
 func siteRouter(sites map[string]http.Handler) http.Handler {
 	base := os.Getenv("BASE_DOMAIN")
 	if base == "" {
@@ -110,17 +111,42 @@ func siteRouter(sites map[string]http.Handler) http.Handler {
 	base = strings.ToLower(strings.TrimSuffix(base, "."))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler, ok := siteFor(r.Host, base, sites)
+		name, handler, ok := siteFor(r.Host, base, sites)
 		if !ok {
 			http.NotFound(w, r)
 			return
+		}
+
+		if name == "root" {
+			if sub, p, found := pathSite(sites, r.URL.Path); found {
+				r = r.Clone(r.Context())
+				r.URL.Path = p
+				r.URL.RawPath = ""
+				handler = sub
+			}
 		}
 
 		handler.ServeHTTP(w, r)
 	})
 }
 
-func siteFor(host, base string, sites map[string]http.Handler) (http.Handler, bool) {
+// pathSite maps /<name>/rest onto sites/<name> for hosts that serve the root
+// site, so <base>/<name>/rest mirrors <name>.<base>/rest.
+func pathSite(sites map[string]http.Handler, p string) (http.Handler, string, bool) {
+	name, rest, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+	if name == "" || name == "root" {
+		return nil, "", false
+	}
+
+	handler, ok := sites[name]
+	if !ok {
+		return nil, "", false
+	}
+
+	return handler, "/" + rest, true
+}
+
+func siteFor(host, base string, sites map[string]http.Handler) (string, http.Handler, bool) {
 	host = strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -131,7 +157,7 @@ func siteFor(host, base string, sites map[string]http.Handler) (http.Handler, bo
 	case base, "www." + base, "localhost", "127.0.0.1", "::1":
 		handler, ok := sites["root"]
 
-		return handler, ok
+		return "root", handler, ok
 	}
 
 	// <name>.<base> and <name>.localhost (handy locally) map to sites/<name>.
@@ -139,13 +165,13 @@ func siteFor(host, base string, sites map[string]http.Handler) (http.Handler, bo
 		if name, found := strings.CutSuffix(host, suffix); found {
 			handler, ok := sites[name]
 
-			return handler, ok
+			return name, handler, ok
 		}
 	}
 
 	handler, ok := sites["root"]
 
-	return handler, ok
+	return "root", handler, ok
 }
 
 // staticHandler serves the embedded site. Files carry a content-hash ETag and
