@@ -44,6 +44,10 @@ const typeConfName = ".type.conf"
 // also keeps it out of site discovery.
 const errorDirName = "_errors"
 
+// devCookieName opts a browser into the dev deployment. The stable front
+// proxies matching requests to DEV_URL; without it, requests stay on stable.
+const devCookieName = "solustrum_dev"
+
 const defaultBaseDomain = "solustrum.com"
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +92,7 @@ func newHandler() (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hello", helloHandler)
 	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/_dev", devHandler)
 
 	// The Cloudflare tunnel points straight at this process, so the deploy
 	// webhook has to be forwarded to its own listener. Unset = disabled.
@@ -122,7 +127,134 @@ func newHandler() (http.Handler, error) {
 
 	mux.Handle("/", siteRouter(sites, notFound))
 
-	return mux, nil
+	handler := http.Handler(mux)
+	if version := os.Getenv("VERSION"); version != "" {
+		handler = versionHeader(handler, version)
+	}
+	if devURL := os.Getenv("DEV_URL"); devURL != "" {
+		dev, err := devRouter(handler, devURL)
+		if err != nil {
+			return nil, err
+		}
+		handler = dev
+	}
+
+	return handler, nil
+}
+
+// devHandler toggles the preview cookie. /_dev?on=1 enables it,
+// /_dev?off=1 clears it, and /_dev alone reports the current state.
+func devHandler(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	switch {
+	case query.Get("on") == "1":
+		setDevCookie(w, r, true)
+		http.Redirect(w, r, "/", http.StatusFound)
+
+		return
+	case query.Get("off") == "1", query.Get("on") == "0", query.Get("on") == "off":
+		setDevCookie(w, r, false)
+		http.Redirect(w, r, "/", http.StatusFound)
+
+		return
+	}
+
+	state := "disabled"
+	if wantsDev(r) {
+		state = "enabled"
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>dev preview</title><h1>dev preview: %s</h1><p><a href="/_dev?on=1">enable</a> &middot; <a href="/_dev?off=1">disable</a></p>`, state)
+}
+
+func setDevCookie(w http.ResponseWriter, r *http.Request, on bool) {
+	cookie := &http.Cookie{
+		Name:     devCookieName,
+		Value:    "1",
+		Path:     "/",
+		Domain:   devCookieDomain(r.Host),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+	}
+	if on {
+		cookie.MaxAge = 30 * 24 * 60 * 60
+	} else {
+		cookie.Value = ""
+		cookie.MaxAge = -1
+	}
+
+	http.SetCookie(w, cookie)
+}
+
+// devCookieDomain scopes the preview cookie to every solustrum.com host, so
+// assets.solustrum.com and foo.solustrum.com switch along with the apex.
+func devCookieDomain(host string) string {
+	host = strings.ToLower(host)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(host, ".")
+
+	base := os.Getenv("BASE_DOMAIN")
+	if base == "" {
+		base = defaultBaseDomain
+	}
+	base = strings.ToLower(strings.TrimSuffix(base, "."))
+
+	if host == base || strings.HasSuffix(host, "."+base) {
+		return "." + base
+	}
+
+	return ""
+}
+
+func wantsDev(r *http.Request) bool {
+	cookie, err := r.Cookie(devCookieName)
+
+	return err == nil && cookie.Value == "1"
+}
+
+// devRouter proxies preview requests to the dev process. Everything except the
+// toggle, health, hello, and deploy paths is eligible, including error-page
+// assets, so a dev page stays internally consistent.
+func devRouter(stable http.Handler, target string) (http.Handler, error) {
+	u, err := url.Parse(target)
+	if err != nil {
+		return nil, fmt.Errorf("parse DEV_URL: %w", err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("DEV_URL must be absolute, got %q", target)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, "dev preview unavailable; disable it at /_dev?off=1", http.StatusBadGateway)
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !wantsDev(r) || isLocalPath(r.URL.Path) {
+			stable.ServeHTTP(w, r)
+
+			return
+		}
+
+		proxy.ServeHTTP(w, r)
+	}), nil
+}
+
+func isLocalPath(p string) bool {
+	return p == "/_dev" || strings.HasPrefix(p, "/_dev/") ||
+		p == "/healthz" || p == "/hello" ||
+		strings.HasPrefix(p, "/deploy/")
+}
+
+func versionHeader(next http.Handler, version string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Solustrum-Version", version)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // folder is one directory in sites/ and how it mounts. A subdomain folder
