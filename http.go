@@ -51,13 +51,25 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 func newHandler() (http.Handler, error) {
 	errorPages := loadErrorPages()
+
+	// plainNotFound is used inside /_err/<code>/, where redirecting to the
+	// error page would loop.
+	plainNotFound := http.NotFound
 	notFound := func(w http.ResponseWriter, r *http.Request) {
-		if page, ok := errorPages[http.StatusNotFound]; ok {
-			page.serve(w, r, http.StatusNotFound)
+		page, ok := errorPages[http.StatusNotFound]
+		if !ok {
+			plainNotFound(w, r)
 			return
 		}
 
-		http.NotFound(w, r)
+		// Send browsers to the page's own URL, so its relative asset links
+		// (index.css, assets/...) resolve against /_err/<code>/ on any host.
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			http.Redirect(w, r, "/_err/404/", http.StatusFound)
+			return
+		}
+
+		page.serve(w, r, http.StatusNotFound)
 	}
 
 	sites, err := loadSites(notFound)
@@ -79,11 +91,25 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
-	// Error pages own their assets at /_err/<code>/..., so a 404 renders the
-	// same on every host instead of depending on the site's files.
+	// Error pages live at /_err/<code>/: the folder's index.html is the page
+	// and the rest of the folder serves its assets. Mounted globally, so a
+	// 404 looks the same on every host, independent of the site that failed.
 	for code, page := range errorPages {
 		prefix := "/_err/" + strconv.Itoa(code) + "/"
-		mux.Handle(prefix, http.StripPrefix(prefix, staticHandler(page.fsys, false, false, notFound)))
+		page, code := page, code
+		assets := staticHandler(page.fsys, false, false, plainNotFound)
+
+		mux.Handle(prefix, http.StripPrefix(prefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// StripPrefix turns the mount root into "" (or "/" via a
+			// browser-normalized request); both mean "serve the page".
+			if r.URL.Path == "" || r.URL.Path == "/" {
+				page.serve(w, r, code)
+
+				return
+			}
+
+			assets.ServeHTTP(w, r)
+		})))
 	}
 
 	mux.Handle("/", siteRouter(sites, notFound))
@@ -134,7 +160,7 @@ func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
 		}
 
 		handlers[name] = site{
-			handler:   staticHandler(root, !withIndex, !withIndex, notFound),
+			handler:   staticHandler(root, !withIndex, true, notFound),
 			withIndex: withIndex,
 		}
 	}
@@ -242,8 +268,13 @@ func siteFor(host, base string, sites map[string]site) (string, site, bool) {
 	}
 
 	// <name>.<base> and <name>.localhost (handy locally) map to sites/<name>.
+	// sites/root is the apex only; root.<base> is not a second copy of it.
 	for _, suffix := range []string{"." + base, ".localhost"} {
 		if name, found := strings.CutSuffix(host, suffix); found {
+			if name == "root" {
+				return "", site{}, false
+			}
+
 			current, ok := sites[name]
 
 			return name, current, ok
