@@ -79,6 +79,13 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
+	// Error pages own their assets at /_err/<code>/..., so a 404 renders the
+	// same on every host instead of depending on the site's files.
+	for code, page := range errorPages {
+		prefix := "/_err/" + strconv.Itoa(code) + "/"
+		mux.Handle(prefix, http.StripPrefix(prefix, staticHandler(page.fsys, false, false, notFound)))
+	}
+
 	mux.Handle("/", siteRouter(sites, notFound))
 
 	return mux, nil
@@ -127,7 +134,7 @@ func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
 		}
 
 		handlers[name] = site{
-			handler:   staticHandler(root, !withIndex, notFound),
+			handler:   staticHandler(root, !withIndex, !withIndex, notFound),
 			withIndex: withIndex,
 		}
 	}
@@ -252,7 +259,7 @@ func siteFor(host, base string, sites map[string]site) (string, site, bool) {
 // as attachments while subdirectories stay browsable. Files carry a
 // content-hash ETag and "no-cache", so caches revalidate instead of replaying
 // stale bytes after a deploy.
-func staticHandler(root fs.FS, download bool, notFound http.HandlerFunc) http.Handler {
+func staticHandler(root fs.FS, download, list bool, notFound http.HandlerFunc) http.Handler {
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -287,6 +294,11 @@ func staticHandler(root fs.FS, download bool, notFound http.HandlerFunc) http.Ha
 			return
 		}
 
+		if info.IsDir() && !list {
+			notFound(w, r)
+			return
+		}
+
 		if download && !info.IsDir() {
 			if disposition := mime.FormatMediaType("attachment", map[string]string{
 				"filename": path.Base(r.URL.Path),
@@ -317,6 +329,7 @@ func hasDotSegment(p string) bool {
 
 // errorPage is a custom body for an HTTP status, loaded from sites/.err_<code>.
 type errorPage struct {
+	fsys fs.FS
 	body []byte
 	etag string
 }
@@ -363,8 +376,17 @@ func loadErrorPages() map[int]errorPage {
 			continue
 		}
 
+		siteRoot, err := fs.Sub(sitesFS, "sites/"+entry.Name())
+		if err != nil {
+			continue
+		}
+
 		sum := sha256.Sum256(body)
-		pages[code] = errorPage{body: body, etag: `"` + hex.EncodeToString(sum[:8]) + `"`}
+		pages[code] = errorPage{
+			fsys: siteRoot,
+			body: body,
+			etag: `"` + hex.EncodeToString(sum[:8]) + `"`,
+		}
 	}
 
 	if len(pages) > 0 {
