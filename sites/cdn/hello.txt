@@ -1,1 +1,0 @@
-cdn: files here download from cdn.solustrum.com/<path>; subdirectories are browsable

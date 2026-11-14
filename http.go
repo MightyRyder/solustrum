@@ -28,7 +28,8 @@ import (
 
 // Every directory under sites/ is compiled into the binary, so a single
 // artifact can be shipped to AWS with no side files. all: is required because
-// .type.conf is a dotfile; it is embedded but never served (hasDotSegment).
+// .type.conf is a dotfile and _errors/ is underscore-prefixed; both are
+// embedded but never served as sites.
 //
 //go:embed all:sites
 var sitesFS embed.FS
@@ -37,6 +38,11 @@ var sitesFS embed.FS
 // "type subdomain" or "type prefix" (bare "subdomain"/"prefix" also works).
 // Missing file: top-level folders are subdomains, nested folders are prefixes.
 const typeConfName = ".type.conf"
+
+// errorDirName holds custom error pages. sites/_errors/404 maps directly to
+// /_errors/404/, so the source path and URL stay identical. The underscore
+// also keeps it out of site discovery.
+const errorDirName = "_errors"
 
 const defaultBaseDomain = "solustrum.com"
 
@@ -59,12 +65,12 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func newHandler() (http.Handler, error) {
 	errorPages := loadErrorPages()
 
-	// plainNotFound is used inside /_err/<code>/, where serving the error page
-	// again would recurse.
+	// plainNotFound is used inside /_errors/<code>/, where serving the error
+	// page again would recurse.
 	plainNotFound := http.NotFound
 	notFound := func(w http.ResponseWriter, r *http.Request) {
 		// Serve the page inline at the URL that failed, so the address bar
-		// keeps the requested path. Its assets are absolute (/_err/<code>/),
+		// keeps the requested path. Its assets are absolute (/_errors/<code>/),
 		// so they resolve on every host and at every depth.
 		if page, ok := errorPages[http.StatusNotFound]; ok {
 			page.serve(w, r, http.StatusNotFound)
@@ -93,11 +99,11 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
-	// Error pages live at /_err/<code>/: the folder's index.html is the page
+	// Error pages live at /_errors/<code>/: the folder's index.html is the page
 	// and the rest of the folder serves its assets. Mounted globally, so a
 	// 404 looks the same on every host, independent of the site that failed.
 	for code, page := range errorPages {
-		prefix := "/_err/" + strconv.Itoa(code) + "/"
+		prefix := "/_errors/" + strconv.Itoa(code) + "/"
 		page, code := page, code
 		assets := staticHandler(page.fsys, false, false, plainNotFound)
 
@@ -131,7 +137,7 @@ type folder struct {
 }
 
 // loadSites walks sites/ and builds one handler per subdomain folder. Hidden
-// and underscore-prefixed folders, plus top-level err_<code> folders, are
+// and underscore-prefixed folders, plus the _errors/ error-page tree, are
 // skipped. A subdomain folder is hidden from its parent's file tree.
 func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
@@ -149,12 +155,12 @@ func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 		}
 
 		name := entry.Name()
-		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
-			skipped = append(skipped, name+" (hidden)")
+		if name == errorDirName {
+			skipped = append(skipped, name+" (error pages)")
 			continue
 		}
-		if errorDirPattern.MatchString(name) {
-			skipped = append(skipped, name+" (error pages)")
+		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+			skipped = append(skipped, name+" (hidden)")
 			continue
 		}
 
@@ -231,9 +237,6 @@ func scanFolder(rel, parentHost string, depth int) (*folder, error) {
 
 		child := entry.Name()
 		if strings.HasPrefix(child, ".") || strings.HasPrefix(child, "_") {
-			continue
-		}
-		if depth == 1 && errorDirPattern.MatchString(child) {
 			continue
 		}
 
@@ -581,7 +584,7 @@ func hasDotSegment(p string) bool {
 	return false
 }
 
-// errorPage is a custom body for an HTTP status, loaded from sites/.err_<code>.
+// errorPage is a custom body for an HTTP status, loaded from sites/_errors/<code>.
 type errorPage struct {
 	fsys fs.FS
 	body []byte
@@ -601,20 +604,21 @@ func (page errorPage) serve(w http.ResponseWriter, r *http.Request, code int) {
 	}
 }
 
-var errorDirPattern = regexp.MustCompile(`^err_(\d{3})$`)
+var errorCodePattern = regexp.MustCompile(`^(\d{3})$`)
 
-// loadErrorPages reads sites/err_<code>/{index,<code>}.html so the site can
-// own its error pages without any code.
+// loadErrorPages reads sites/_errors/<code>/{index,<code>}.html so the site
+// can own its error pages without any code.
 func loadErrorPages() map[int]errorPage {
 	pages := make(map[int]errorPage)
+	root := path.Join("sites", errorDirName)
 
-	entries, err := fs.ReadDir(sitesFS, "sites")
+	entries, err := fs.ReadDir(sitesFS, root)
 	if err != nil {
 		return pages
 	}
 
 	for _, entry := range entries {
-		match := errorDirPattern.FindStringSubmatch(entry.Name())
+		match := errorCodePattern.FindStringSubmatch(entry.Name())
 		if match == nil || !entry.IsDir() {
 			continue
 		}
@@ -624,13 +628,14 @@ func loadErrorPages() map[int]errorPage {
 			continue
 		}
 
-		body := readErrorPage("sites/"+entry.Name(), code)
+		dir := path.Join(root, entry.Name())
+		body := readErrorPage(dir, code)
 		if body == nil {
-			log.Printf("error page %s has no html", entry.Name())
+			log.Printf("error page %s has no html", dir)
 			continue
 		}
 
-		siteRoot, err := fs.Sub(sitesFS, "sites/"+entry.Name())
+		siteRoot, err := fs.Sub(sitesFS, dir)
 		if err != nil {
 			continue
 		}
