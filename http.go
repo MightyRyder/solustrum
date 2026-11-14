@@ -90,13 +90,13 @@ func newHandler() (http.Handler, error) {
 // a plain file tree, so a CDN folder needs no index.html and gets no directory
 // listing. sites/root answers the apex; every other name gets <name>.<base> and
 // a path prefix on the apex.
-func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
+func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
 	if err != nil {
 		return nil, fmt.Errorf("read sites: %w", err)
 	}
 
-	handlers := make(map[string]http.Handler, len(entries))
+	handlers := make(map[string]site, len(entries))
 	var accepted, skipped []string
 
 	for _, entry := range entries {
@@ -123,10 +123,13 @@ func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 		if withIndex {
 			accepted = append(accepted, name+" (site)")
 		} else {
-			accepted = append(accepted, name+" (files)")
+			accepted = append(accepted, name+" (files, subdomain only)")
 		}
 
-		handlers[name] = staticHandler(root, withIndex, notFound)
+		handlers[name] = site{
+			handler:   staticHandler(root, !withIndex, notFound),
+			withIndex: withIndex,
+		}
 	}
 
 	if _, ok := handlers["root"]; !ok {
@@ -164,11 +167,17 @@ func hasHTML(root fs.FS) bool {
 	return found
 }
 
-// siteRouter serves every folder in sites/ two ways: as its own hostname and
-// as a path prefix on the apex, so sites/website answers both
-// website.<base> and <base>/website/. sites/root is the apex itself, and
-// anything nested stays a path under both.
-func siteRouter(sites map[string]http.Handler, notFound http.HandlerFunc) http.Handler {
+// site is one folder in sites/. A folder with html is a real site and answers
+// both its hostname and an apex path prefix. A folder without html is a file
+// drop: subdomain only, files download, subdirectories stay browsable.
+type site struct {
+	handler   http.Handler
+	withIndex bool
+}
+
+// siteRouter picks the folder for the request. Sites answer both
+// <name>.<base> and <base>/<name>/. File drops answer only <name>.<base>.
+func siteRouter(sites map[string]site, notFound http.HandlerFunc) http.Handler {
 	base := os.Getenv("BASE_DOMAIN")
 	if base == "" {
 		base = defaultBaseDomain
@@ -176,7 +185,7 @@ func siteRouter(sites map[string]http.Handler, notFound http.HandlerFunc) http.H
 	base = strings.ToLower(strings.TrimSuffix(base, "."))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		name, handler, ok := siteFor(r.Host, base, sites)
+		name, current, ok := siteFor(r.Host, base, sites)
 		if !ok {
 			notFound(w, r)
 			return
@@ -187,31 +196,31 @@ func siteRouter(sites map[string]http.Handler, notFound http.HandlerFunc) http.H
 				r = r.Clone(r.Context())
 				r.URL.Path = p
 				r.URL.RawPath = ""
-				handler = sub
+				current = sub
 			}
 		}
 
-		handler.ServeHTTP(w, r)
+		current.handler.ServeHTTP(w, r)
 	})
 }
 
 // pathSite maps /<name>/rest onto sites/<name> for hosts that serve the root
-// site, so <base>/<name>/rest mirrors <name>.<base>/rest.
-func pathSite(sites map[string]http.Handler, p string) (http.Handler, string, bool) {
+// site. Only folders with an index qualify.
+func pathSite(sites map[string]site, p string) (site, string, bool) {
 	name, rest, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
 	if name == "" || name == "root" {
-		return nil, "", false
+		return site{}, "", false
 	}
 
-	handler, ok := sites[name]
-	if !ok {
-		return nil, "", false
+	current, ok := sites[name]
+	if !ok || !current.withIndex {
+		return site{}, "", false
 	}
 
-	return handler, "/" + rest, true
+	return current, "/" + rest, true
 }
 
-func siteFor(host, base string, sites map[string]http.Handler) (string, http.Handler, bool) {
+func siteFor(host, base string, sites map[string]site) (string, site, bool) {
 	host = strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -220,17 +229,17 @@ func siteFor(host, base string, sites map[string]http.Handler) (string, http.Han
 
 	switch host {
 	case base, "www." + base, "localhost", "127.0.0.1", "::1":
-		handler, ok := sites["root"]
+		current, ok := sites["root"]
 
-		return "root", handler, ok
+		return "root", current, ok
 	}
 
 	// <name>.<base> and <name>.localhost (handy locally) map to sites/<name>.
 	for _, suffix := range []string{"." + base, ".localhost"} {
 		if name, found := strings.CutSuffix(host, suffix); found {
-			handler, ok := sites[name]
+			current, ok := sites[name]
 
-			return name, handler, ok
+			return name, current, ok
 		}
 	}
 
@@ -239,12 +248,11 @@ func siteFor(host, base string, sites map[string]http.Handler) (string, http.Han
 	return "root", handler, ok
 }
 
-// staticHandler serves the embedded site. Files carry a content-hash ETag and
-// "no-cache", so browsers and Cloudflare revalidate (cheap 304) instead of
-// replaying stale bytes after a deploy.
-func staticHandler(root fs.FS, withIndex bool, notFound http.HandlerFunc) http.Handler {
-	// A folder without html is an asset drop: every file is a download.
-	download := !withIndex
+// staticHandler serves one folder. In download mode (no html) files are sent
+// as attachments while subdirectories stay browsable. Files carry a
+// content-hash ETag and "no-cache", so caches revalidate instead of replaying
+// stale bytes after a deploy.
+func staticHandler(root fs.FS, download bool, notFound http.HandlerFunc) http.Handler {
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -268,19 +276,18 @@ func staticHandler(root fs.FS, withIndex bool, notFound http.HandlerFunc) http.H
 			return
 		}
 
-		// A file-only folder (sites/cdn) answers files, never a directory:
-		// no index page and no listing.
-		if !withIndex && strings.HasSuffix(r.URL.Path, "/") {
+		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		if name == "" {
+			name = "."
+		}
+
+		info, err := fs.Stat(root, name)
+		if err != nil {
 			notFound(w, r)
 			return
 		}
 
-		if _, err := fs.Stat(root, strings.TrimPrefix(assetName(r.URL.Path), "/")); err != nil {
-			notFound(w, r)
-			return
-		}
-
-		if download {
+		if download && !info.IsDir() {
 			if disposition := mime.FormatMediaType("attachment", map[string]string{
 				"filename": path.Base(r.URL.Path),
 			}); disposition != "" {
