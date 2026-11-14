@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"mime"
@@ -25,11 +26,17 @@ import (
 	"time"
 )
 
-// Every directory under sites/ is compiled into the binary and served as its
-// own hostname, so a single artifact can be shipped to AWS with no side files.
+// Every directory under sites/ is compiled into the binary, so a single
+// artifact can be shipped to AWS with no side files. all: is required because
+// .type.conf is a dotfile; it is embedded but never served (hasDotSegment).
 //
-//go:embed sites
+//go:embed all:sites
 var sitesFS embed.FS
+
+// typeConfName overrides how a folder is mounted. Content is either
+// "type subdomain" or "type prefix" (bare "subdomain"/"prefix" also works).
+// Missing file: top-level folders are subdomains, nested folders are prefixes.
+const typeConfName = ".type.conf"
 
 const defaultBaseDomain = "solustrum.com"
 
@@ -112,20 +119,29 @@ func newHandler() (http.Handler, error) {
 	return mux, nil
 }
 
-// loadSites decides what lives in sites/: hidden, underscore-prefixed and
-// err_<code> names are skipped (sites/err_404 is error pages, not a site). A folder with
-// html is a site and answers its own index; a folder without html is served as
-// a plain file tree, so a CDN folder needs no index.html and gets no directory
-// listing. sites/root answers the apex; every other name gets <name>.<base> and
-// a path prefix on the apex.
-func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
+// folder is one directory in sites/ and how it mounts. A subdomain folder
+// owns a hostname (and a handler); a prefix folder is just a path inside its
+// nearest subdomain ancestor.
+type folder struct {
+	name string
+	rel  string // slash path relative to sites/, e.g. "foo/bar"
+	kind string // "subdomain" or "prefix"
+	host string // subdomain label chain, e.g. "bar.foo"; empty for sites/root
+	kids []*folder
+}
+
+// loadSites walks sites/ and builds one handler per subdomain folder. Hidden
+// and underscore-prefixed folders, plus top-level err_<code> folders, are
+// skipped. A subdomain folder is hidden from its parent's file tree.
+func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
 	if err != nil {
 		return nil, fmt.Errorf("read sites: %w", err)
 	}
 
-	handlers := make(map[string]site, len(entries))
-	var accepted, skipped []string
+	handlers := make(map[string]http.Handler)
+	var trees []*folder
+	var skipped []string
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -142,21 +158,17 @@ func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
 			continue
 		}
 
-		root, err := fs.Sub(sitesFS, "sites/"+name)
+		tree, err := scanFolder(name, "", 1)
 		if err != nil {
-			return nil, fmt.Errorf("sub sites/%s: %w", name, err)
+			return nil, err
 		}
+		trees = append(trees, tree)
+	}
 
-		withIndex := hasHTML(root)
-		if withIndex {
-			accepted = append(accepted, name+" (site)")
-		} else {
-			accepted = append(accepted, name+" (files, subdomain only)")
-		}
-
-		handlers[name] = site{
-			handler:   staticHandler(root, !withIndex, true, notFound),
-			withIndex: withIndex,
+	var accepted []string
+	for _, tree := range trees {
+		if err := registerSites(tree, handlers, notFound, &accepted); err != nil {
+			return nil, err
 		}
 	}
 
@@ -172,6 +184,168 @@ func loadSites(notFound http.HandlerFunc) (map[string]site, error) {
 	}
 
 	return handlers, nil
+}
+
+// scanFolder reads one folder's mount type and recurses. parentHost is the
+// host of the nearest subdomain ancestor ("" for sites/root and the apex).
+// Missing .type.conf means subdomain at depth 1 and prefix below it.
+func scanFolder(rel, parentHost string, depth int) (*folder, error) {
+	name := path.Base(rel)
+	kind := readTypeConf(rel)
+
+	if name == "root" && depth == 1 {
+		kind = "subdomain"
+	}
+	if kind == "" {
+		if depth == 1 {
+			kind = "subdomain"
+		} else {
+			kind = "prefix"
+		}
+	}
+	if depth == 1 && kind == "prefix" {
+		return nil, fmt.Errorf("sites/%s: type prefix at the top level has no parent site", rel)
+	}
+
+	f := &folder{name: name, rel: rel, kind: kind}
+	switch {
+	case name == "root" && depth == 1:
+		f.host = "" // the apex
+	case kind == "subdomain" && parentHost == "":
+		f.host = name
+	case kind == "subdomain":
+		f.host = name + "." + parentHost
+	default:
+		f.host = parentHost
+	}
+
+	entries, err := fs.ReadDir(sitesFS, "sites/"+rel)
+	if err != nil {
+		return nil, fmt.Errorf("read sites/%s: %w", rel, err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		child := entry.Name()
+		if strings.HasPrefix(child, ".") || strings.HasPrefix(child, "_") {
+			continue
+		}
+		if depth == 1 && errorDirPattern.MatchString(child) {
+			continue
+		}
+
+		kid, err := scanFolder(path.Join(rel, child), f.host, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		f.kids = append(f.kids, kid)
+	}
+
+	return f, nil
+}
+
+// readTypeConf returns the declared mount type, or "" when the file is absent
+// or says something unrecognized (the caller then applies the default).
+func readTypeConf(rel string) string {
+	data, err := fs.ReadFile(sitesFS, path.Join("sites", rel, typeConfName))
+	if err != nil {
+		return ""
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.ToLower(line))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		for _, word := range strings.FieldsFunc(line, func(r rune) bool {
+			return r < 'a' || r > 'z'
+		}) {
+			if word == "subdomain" || word == "prefix" {
+				return word
+			}
+		}
+
+		log.Printf("sites/%s/%s: expected subdomain or prefix, got %q", rel, typeConfName, line)
+
+		return ""
+	}
+
+	return ""
+}
+
+// registerSites creates a handler for every subdomain folder in the tree.
+// Prefix folders are not registered: their nearest subdomain ancestor serves
+// them as a path, and any subdomain below them is registered in its own right.
+func registerSites(f *folder, handlers map[string]http.Handler, notFound http.HandlerFunc, accepted *[]string) error {
+	if f.kind == "subdomain" {
+		key := f.host
+		if f.rel == "root" {
+			key = "root"
+		}
+		if _, exists := handlers[key]; exists {
+			return fmt.Errorf("sites/%s: host %q is already used", f.rel, key)
+		}
+		if key == "root" && f.rel != "root" {
+			return fmt.Errorf("sites/%s: host %q is reserved for the apex", f.rel, key)
+		}
+
+		root, err := fs.Sub(sitesFS, "sites/"+f.rel)
+		if err != nil {
+			return fmt.Errorf("sub sites/%s: %w", f.rel, err)
+		}
+
+		visible := hideSubdomains(root, f)
+		withIndex := hasHTML(visible)
+		handlers[key] = staticHandler(visible, !withIndex, true, notFound)
+
+		siteKind := "site"
+		if !withIndex {
+			siteKind = "files"
+		}
+		where := "host " + key
+		if f.rel == "root" {
+			where = "apex"
+		}
+		*accepted = append(*accepted, fmt.Sprintf("%s (%s, %s)", f.rel, where, siteKind))
+	}
+
+	for _, kid := range f.kids {
+		if err := registerSites(kid, handlers, notFound, accepted); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// hideSubdomains removes every nested subdomain folder from a handler's tree,
+// so foo.solustrum.com cannot serve sites/foo/bar once bar has its own host.
+// Prefix folders are walked through; the first subdomain stops the descent
+// because that folder owns its own handler and its own hidden set.
+func hideSubdomains(root fs.FS, f *folder) fs.FS {
+	var hidden []string
+
+	var walk func(n *folder)
+	walk = func(n *folder) {
+		for _, kid := range n.kids {
+			if kid.kind == "subdomain" {
+				hidden = append(hidden, strings.TrimPrefix(kid.rel, f.rel+"/"))
+				continue
+			}
+			walk(kid)
+		}
+	}
+	walk(f)
+
+	if len(hidden) == 0 {
+		return root
+	}
+
+	return newHideFS(root, hidden)
 }
 
 // hasHTML reports whether a site folder contains at least one page.
@@ -195,17 +369,9 @@ func hasHTML(root fs.FS) bool {
 	return found
 }
 
-// site is one folder in sites/. A folder with html is a real site and answers
-// both its hostname and an apex path prefix. A folder without html is a file
-// drop: subdomain only, files download, subdirectories stay browsable.
-type site struct {
-	handler   http.Handler
-	withIndex bool
-}
-
-// siteRouter picks the folder for the request. Sites answer both
-// <name>.<base> and <base>/<name>/. File drops answer only <name>.<base>.
-func siteRouter(sites map[string]site, notFound http.HandlerFunc) http.Handler {
+// siteRouter maps the request host to the folder that owns it. Hosts answer
+// only on their own name; there is no apex path mirror.
+func siteRouter(sites map[string]http.Handler, notFound http.HandlerFunc) http.Handler {
 	base := os.Getenv("BASE_DOMAIN")
 	if base == "" {
 		base = defaultBaseDomain
@@ -213,42 +379,19 @@ func siteRouter(sites map[string]site, notFound http.HandlerFunc) http.Handler {
 	base = strings.ToLower(strings.TrimSuffix(base, "."))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		name, current, ok := siteFor(r.Host, base, sites)
+		handler, ok := siteFor(r.Host, base, sites)
 		if !ok {
 			notFound(w, r)
 			return
 		}
 
-		if name == "root" {
-			if sub, p, found := pathSite(sites, r.URL.Path); found {
-				r = r.Clone(r.Context())
-				r.URL.Path = p
-				r.URL.RawPath = ""
-				current = sub
-			}
-		}
-
-		current.handler.ServeHTTP(w, r)
+		handler.ServeHTTP(w, r)
 	})
 }
 
-// pathSite maps /<name>/rest onto sites/<name> for hosts that serve the root
-// site. Only folders with an index qualify.
-func pathSite(sites map[string]site, p string) (site, string, bool) {
-	name, rest, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
-	if name == "" || name == "root" {
-		return site{}, "", false
-	}
-
-	current, ok := sites[name]
-	if !ok || !current.withIndex {
-		return site{}, "", false
-	}
-
-	return current, "/" + rest, true
-}
-
-func siteFor(host, base string, sites map[string]site) (string, site, bool) {
+// siteFor maps the apex and <label>.<base> to a registered host. Nested
+// subdomains match their full label chain, e.g. bar.foo.<base>.
+func siteFor(host, base string, sites map[string]http.Handler) (http.Handler, bool) {
 	host = strings.ToLower(host)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
@@ -257,28 +400,113 @@ func siteFor(host, base string, sites map[string]site) (string, site, bool) {
 
 	switch host {
 	case base, "www." + base, "localhost", "127.0.0.1", "::1":
-		current, ok := sites["root"]
+		handler, ok := sites["root"]
 
-		return "root", current, ok
+		return handler, ok
 	}
 
-	// <name>.<base> and <name>.localhost (handy locally) map to sites/<name>.
-	// sites/root is the apex only; root.<base> is not a second copy of it.
 	for _, suffix := range []string{"." + base, ".localhost"} {
-		if name, found := strings.CutSuffix(host, suffix); found {
-			if name == "root" {
-				return "", site{}, false
+		if key, found := strings.CutSuffix(host, suffix); found {
+			// sites/root is the apex only; root.<base> is not a second copy.
+			if key == "root" {
+				return nil, false
 			}
 
-			current, ok := sites[name]
+			handler, ok := sites[key]
 
-			return name, current, ok
+			return handler, ok
 		}
 	}
 
 	handler, ok := sites["root"]
 
-	return "root", handler, ok
+	return handler, ok
+}
+
+// hideFS hides paths from an fs.FS. It keeps nested subdomain folders out of
+// their parent's file server, directory listings, and hasHTML scan.
+type hideFS struct {
+	fsys   fs.FS
+	hidden map[string]struct{}
+}
+
+func newHideFS(fsys fs.FS, hidden []string) fs.FS {
+	set := make(map[string]struct{}, len(hidden))
+	for _, p := range hidden {
+		set[path.Clean(p)] = struct{}{}
+	}
+
+	return hideFS{fsys: fsys, hidden: set}
+}
+
+func (h hideFS) isHidden(name string) bool {
+	name = path.Clean(name)
+	if name == "." {
+		return false
+	}
+
+	for hidden := range h.hidden {
+		if name == hidden || strings.HasPrefix(name, hidden+"/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (h hideFS) Open(name string) (fs.File, error) {
+	if h.isHidden(name) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	}
+
+	f, err := h.fsys.Open(name)
+	if err != nil {
+		return nil, err
+	}
+
+	dir, ok := f.(fs.ReadDirFile)
+	if !ok {
+		return f, nil
+	}
+
+	return hideDir{ReadDirFile: dir, fsys: h, dir: path.Clean(name)}, nil
+}
+
+type hideDir struct {
+	fs.ReadDirFile
+	fsys hideFS
+	dir  string
+}
+
+func (d hideDir) ReadDir(n int) ([]fs.DirEntry, error) {
+	var out []fs.DirEntry
+
+	for {
+		entries, err := d.ReadDirFile.ReadDir(n)
+		for _, entry := range entries {
+			if !d.fsys.isHidden(path.Join(d.dir, entry.Name())) {
+				out = append(out, entry)
+			}
+		}
+
+		if n <= 0 {
+			if errors.Is(err, io.EOF) {
+				err = nil
+			}
+
+			return out, err
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) && len(out) > 0 {
+				return out, nil
+			}
+
+			return out, err
+		}
+		if len(out) >= n {
+			return out, nil
+		}
+	}
 }
 
 // staticHandler serves one folder. In download mode (no html) files are sent
