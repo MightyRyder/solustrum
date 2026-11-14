@@ -1,0 +1,1 @@
+cdn placeholder: drop files here and they serve at /cdn/<name> and cdn.solustrum.com/<name>

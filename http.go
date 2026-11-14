@@ -27,10 +27,7 @@ import (
 // Every directory under sites/ is compiled into the binary and served as its
 // own hostname, so a single artifact can be shipped to AWS with no side files.
 //
-// all: is required so dot-directories are embedded too; sites/.err_404 holds
-// custom error pages. Serving code still refuses dot paths (see staticHandler).
-//
-//go:embed all:sites
+//go:embed sites
 var sitesFS embed.FS
 
 const defaultBaseDomain = "solustrum.com"
@@ -86,8 +83,8 @@ func newHandler() (http.Handler, error) {
 	return mux, nil
 }
 
-// loadSites decides what lives in sites/: hidden or underscore-prefixed names
-// are skipped (sites/.err_404 is for error pages, not a site). A folder with
+// loadSites decides what lives in sites/: hidden, underscore-prefixed and
+// err_<code> names are skipped (sites/err_404 is error pages, not a site). A folder with
 // html is a site and answers its own index; a folder without html is served as
 // a plain file tree, so a CDN folder needs no index.html and gets no directory
 // listing. sites/root answers the apex; every other name gets <name>.<base> and
@@ -109,6 +106,10 @@ func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 		name := entry.Name()
 		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
 			skipped = append(skipped, name+" (hidden)")
+			continue
+		}
+		if errorDirPattern.MatchString(name) {
+			skipped = append(skipped, name+" (error pages)")
 			continue
 		}
 
@@ -315,9 +316,9 @@ func (page errorPage) serve(w http.ResponseWriter, r *http.Request, code int) {
 	}
 }
 
-var errorDirPattern = regexp.MustCompile(`^\.err_(\d{3})$`)
+var errorDirPattern = regexp.MustCompile(`^err_(\d{3})$`)
 
-// loadErrorPages reads sites/.err_<code>/{index,<code>}.html so the site can
+// loadErrorPages reads sites/err_<code>/{index,<code>}.html so the site can
 // own its error pages without any code.
 func loadErrorPages() map[int]errorPage {
 	pages := make(map[int]errorPage)
