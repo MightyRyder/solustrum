@@ -93,6 +93,7 @@ func newHandler() (http.Handler, error) {
 	mux.HandleFunc("/hello", helloHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/_dev", devHandler)
+	mux.HandleFunc("/_dev/status", devStatusHandler)
 
 	// The Cloudflare tunnel points straight at this process, so the deploy
 	// webhook has to be forwarded to its own listener. Unset = disabled.
@@ -143,18 +144,19 @@ func newHandler() (http.Handler, error) {
 }
 
 // devHandler toggles the preview cookie. /_dev?on=1 enables it,
-// /_dev?off=1 clears it, and /_dev alone reports the current state.
+// /_dev?off=1 clears it, /_dev/status returns JSON, and /_dev alone reports
+// the current state.
 func devHandler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	switch {
 	case query.Get("on") == "1":
 		setDevCookie(w, r, true)
-		http.Redirect(w, r, "/", http.StatusFound)
+		redirectNext(w, r)
 
 		return
 	case query.Get("off") == "1", query.Get("on") == "0", query.Get("on") == "off":
 		setDevCookie(w, r, false)
-		http.Redirect(w, r, "/", http.StatusFound)
+		redirectNext(w, r)
 
 		return
 	}
@@ -166,6 +168,23 @@ func devHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w, `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><title>dev preview</title><h1>dev preview: %s</h1><p><a href="/_dev?on=1">enable</a> &middot; <a href="/_dev?off=1">disable</a></p>`, state)
+}
+
+// redirectNext sends the toggle back to a safe local path. The /dev page uses
+// ?next=/dev/ so the button behaves like a toggle instead of jumping home.
+func redirectNext(w http.ResponseWriter, r *http.Request) {
+	next := r.URL.Query().Get("next")
+	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.ContainsAny(next, "\\\r\n") {
+		next = "/"
+	}
+
+	http.Redirect(w, r, next, http.StatusFound)
+}
+
+func devStatusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = fmt.Fprintf(w, `{"enabled":%t}`, wantsDev(r))
 }
 
 func setDevCookie(w http.ResponseWriter, r *http.Request, on bool) {
