@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -242,6 +243,8 @@ func siteFor(host, base string, sites map[string]http.Handler) (string, http.Han
 // "no-cache", so browsers and Cloudflare revalidate (cheap 304) instead of
 // replaying stale bytes after a deploy.
 func staticHandler(root fs.FS, withIndex bool, notFound http.HandlerFunc) http.Handler {
+	// A folder without html is an asset drop: every file is a download.
+	download := !withIndex
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -275,6 +278,14 @@ func staticHandler(root fs.FS, withIndex bool, notFound http.HandlerFunc) http.H
 		if _, err := fs.Stat(root, strings.TrimPrefix(assetName(r.URL.Path), "/")); err != nil {
 			notFound(w, r)
 			return
+		}
+
+		if download {
+			if disposition := mime.FormatMediaType("attachment", map[string]string{
+				"filename": path.Base(r.URL.Path),
+			}); disposition != "" {
+				w.Header().Set("Content-Disposition", disposition)
+			}
 		}
 
 		if tag, ok := etags[assetName(r.URL.Path)]; ok {
