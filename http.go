@@ -110,7 +110,7 @@ func newHandler() (http.Handler, error) {
 	for code, page := range errorPages {
 		prefix := "/_errors/" + strconv.Itoa(code) + "/"
 		page, code := page, code
-		assets := staticHandler(page.fsys, false, false, plainNotFound)
+		assets := staticHandler(page.fsys, false, false, false, plainNotFound)
 
 		mux.Handle(prefix, http.StripPrefix(prefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// StripPrefix turns the mount root into "" (or "/" via a
@@ -435,7 +435,7 @@ func registerSites(f *folder, handlers map[string]http.Handler, notFound http.Ha
 
 		visible := hideSubdomains(root, f)
 		withIndex := hasHTML(visible)
-		handlers[key] = staticHandler(visible, !withIndex, true, notFound)
+		handlers[key] = staticHandler(visible, !withIndex, true, key == "assets", notFound)
 
 		siteKind := "site"
 		if !withIndex {
@@ -647,8 +647,10 @@ func (d hideDir) ReadDir(n int) ([]fs.DirEntry, error) {
 // staticHandler serves one folder. In download mode (no html) files are sent
 // as attachments while subdirectories stay browsable. Files carry a
 // content-hash ETag and "no-cache", so caches revalidate instead of replaying
-// stale bytes after a deploy.
-func staticHandler(root fs.FS, download, list bool, notFound http.HandlerFunc) http.Handler {
+// stale bytes after a deploy. noStore disables shared caching entirely; the
+// assets host uses it so preview requests can never be served a stable cache
+// entry instead of dev bytes.
+func staticHandler(root fs.FS, download, list, noStore bool, notFound http.HandlerFunc) http.Handler {
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -696,7 +698,9 @@ func staticHandler(root fs.FS, download, list bool, notFound http.HandlerFunc) h
 			}
 		}
 
-		if tag, ok := etags[assetName(r.URL.Path)]; ok {
+		if noStore {
+			w.Header().Set("Cache-Control", "no-store")
+		} else if tag, ok := etags[assetName(r.URL.Path)]; ok {
 			w.Header().Set("ETag", tag)
 			w.Header().Set("Cache-Control", "no-cache")
 		}
