@@ -52,24 +52,19 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 func newHandler() (http.Handler, error) {
 	errorPages := loadErrorPages()
 
-	// plainNotFound is used inside /_err/<code>/, where redirecting to the
-	// error page would loop.
+	// plainNotFound is used inside /_err/<code>/, where serving the error page
+	// again would recurse.
 	plainNotFound := http.NotFound
 	notFound := func(w http.ResponseWriter, r *http.Request) {
-		page, ok := errorPages[http.StatusNotFound]
-		if !ok {
-			plainNotFound(w, r)
+		// Serve the page inline at the URL that failed, so the address bar
+		// keeps the requested path. Its assets are absolute (/_err/<code>/),
+		// so they resolve on every host and at every depth.
+		if page, ok := errorPages[http.StatusNotFound]; ok {
+			page.serve(w, r, http.StatusNotFound)
 			return
 		}
 
-		// Send browsers to the page's own URL, so its relative asset links
-		// (index.css, assets/...) resolve against /_err/<code>/ on any host.
-		if r.Method == http.MethodGet || r.Method == http.MethodHead {
-			http.Redirect(w, r, "/_err/404/", http.StatusFound)
-			return
-		}
-
-		page.serve(w, r, http.StatusNotFound)
+		plainNotFound(w, r)
 	}
 
 	sites, err := loadSites(notFound)
