@@ -16,7 +16,9 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,7 +27,10 @@ import (
 // Every directory under sites/ is compiled into the binary and served as its
 // own hostname, so a single artifact can be shipped to AWS with no side files.
 //
-//go:embed sites
+// all: is required so dot-directories are embedded too; sites/.err_404 holds
+// custom error pages. Serving code still refuses dot paths (see staticHandler).
+//
+//go:embed all:sites
 var sitesFS embed.FS
 
 const defaultBaseDomain = "solustrum.com"
@@ -47,7 +52,17 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func newHandler() (http.Handler, error) {
-	sites, err := loadSites()
+	errorPages := loadErrorPages()
+	notFound := func(w http.ResponseWriter, r *http.Request) {
+		if page, ok := errorPages[http.StatusNotFound]; ok {
+			page.serve(w, r, http.StatusNotFound)
+			return
+		}
+
+		http.NotFound(w, r)
+	}
+
+	sites, err := loadSites(notFound)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +81,7 @@ func newHandler() (http.Handler, error) {
 		mux.Handle("/deploy/solustrum", httputil.NewSingleHostReverseProxy(u))
 	}
 
-	mux.Handle("/", siteRouter(sites))
+	mux.Handle("/", siteRouter(sites, notFound))
 
 	return mux, nil
 }
@@ -77,7 +92,7 @@ func newHandler() (http.Handler, error) {
 // a plain file tree, so a CDN folder needs no index.html and gets no directory
 // listing. sites/root answers the apex; every other name gets <name>.<base> and
 // a path prefix on the apex.
-func loadSites() (map[string]http.Handler, error) {
+func loadSites(notFound http.HandlerFunc) (map[string]http.Handler, error) {
 	entries, err := fs.ReadDir(sitesFS, "sites")
 	if err != nil {
 		return nil, fmt.Errorf("read sites: %w", err)
@@ -109,7 +124,7 @@ func loadSites() (map[string]http.Handler, error) {
 			accepted = append(accepted, name+" (files)")
 		}
 
-		handlers[name] = staticHandler(root, withIndex)
+		handlers[name] = staticHandler(root, withIndex, notFound)
 	}
 
 	if _, ok := handlers["root"]; !ok {
@@ -151,7 +166,7 @@ func hasHTML(root fs.FS) bool {
 // as a path prefix on the apex, so sites/website answers both
 // website.<base> and <base>/website/. sites/root is the apex itself, and
 // anything nested stays a path under both.
-func siteRouter(sites map[string]http.Handler) http.Handler {
+func siteRouter(sites map[string]http.Handler, notFound http.HandlerFunc) http.Handler {
 	base := os.Getenv("BASE_DOMAIN")
 	if base == "" {
 		base = defaultBaseDomain
@@ -161,7 +176,7 @@ func siteRouter(sites map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name, handler, ok := siteFor(r.Host, base, sites)
 		if !ok {
-			http.NotFound(w, r)
+			notFound(w, r)
 			return
 		}
 
@@ -225,7 +240,7 @@ func siteFor(host, base string, sites map[string]http.Handler) (string, http.Han
 // staticHandler serves the embedded site. Files carry a content-hash ETag and
 // "no-cache", so browsers and Cloudflare revalidate (cheap 304) instead of
 // replaying stale bytes after a deploy.
-func staticHandler(root fs.FS, withIndex bool) http.Handler {
+func staticHandler(root fs.FS, withIndex bool, notFound http.HandlerFunc) http.Handler {
 	etags := make(map[string]string)
 	_ = fs.WalkDir(root, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -243,10 +258,21 @@ func staticHandler(root fs.FS, withIndex bool) http.Handler {
 	files := http.FileServer(http.FS(root))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hidden files are embedded for error pages, never served.
+		if hasDotSegment(r.URL.Path) {
+			notFound(w, r)
+			return
+		}
+
 		// A file-only folder (sites/cdn) answers files, never a directory:
 		// no index page and no listing.
 		if !withIndex && strings.HasSuffix(r.URL.Path, "/") {
-			http.NotFound(w, r)
+			notFound(w, r)
+			return
+		}
+
+		if _, err := fs.Stat(root, strings.TrimPrefix(assetName(r.URL.Path), "/")); err != nil {
+			notFound(w, r)
 			return
 		}
 
@@ -257,6 +283,107 @@ func staticHandler(root fs.FS, withIndex bool) http.Handler {
 
 		files.ServeHTTP(w, r)
 	})
+}
+
+// hasDotSegment reports whether any path segment starts with a dot.
+func hasDotSegment(p string) bool {
+	for _, segment := range strings.Split(p, "/") {
+		if strings.HasPrefix(segment, ".") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// errorPage is a custom body for an HTTP status, loaded from sites/.err_<code>.
+type errorPage struct {
+	body []byte
+	etag string
+}
+
+func (page errorPage) serve(w http.ResponseWriter, r *http.Request, code int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	if page.etag != "" {
+		w.Header().Set("ETag", page.etag)
+	}
+	w.WriteHeader(code)
+
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(page.body)
+	}
+}
+
+var errorDirPattern = regexp.MustCompile(`^\.err_(\d{3})$`)
+
+// loadErrorPages reads sites/.err_<code>/{index,<code>}.html so the site can
+// own its error pages without any code.
+func loadErrorPages() map[int]errorPage {
+	pages := make(map[int]errorPage)
+
+	entries, err := fs.ReadDir(sitesFS, "sites")
+	if err != nil {
+		return pages
+	}
+
+	for _, entry := range entries {
+		match := errorDirPattern.FindStringSubmatch(entry.Name())
+		if match == nil || !entry.IsDir() {
+			continue
+		}
+
+		code, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+
+		body := readErrorPage("sites/"+entry.Name(), code)
+		if body == nil {
+			log.Printf("error page %s has no html", entry.Name())
+			continue
+		}
+
+		sum := sha256.Sum256(body)
+		pages[code] = errorPage{body: body, etag: `"` + hex.EncodeToString(sum[:8]) + `"`}
+	}
+
+	if len(pages) > 0 {
+		codes := make([]int, 0, len(pages))
+		for code := range pages {
+			codes = append(codes, code)
+		}
+		sort.Ints(codes)
+		log.Printf("error pages: %v", codes)
+	}
+
+	return pages
+}
+
+func readErrorPage(dir string, code int) []byte {
+	names := []string{"index.html", strconv.Itoa(code) + ".html"}
+
+	for _, name := range names {
+		if data, err := fs.ReadFile(sitesFS, path.Join(dir, name)); err == nil {
+			return data
+		}
+	}
+
+	entries, err := fs.ReadDir(sitesFS, dir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(path.Ext(entry.Name()), ".html") {
+			continue
+		}
+		if data, err := fs.ReadFile(sitesFS, path.Join(dir, entry.Name())); err == nil {
+			return data
+		}
+	}
+
+	return nil
 }
 
 // assetName maps a request path to the embedded file that answers it.
